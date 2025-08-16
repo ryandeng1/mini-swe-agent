@@ -42,14 +42,15 @@ class InteractiveAgent(DefaultAgent):
     def add_message(self, role: str, content: str, **kwargs):
         # Extend supermethod to print messages
         super().add_message(role, content, **kwargs)
+        kwargs_str = f" ({kwargs})" if kwargs else ""
         if role == "assistant":
             console.print(
-                f"\n[red][bold]mini-swe-agent[/bold] (step [bold]{self.model.n_calls}[/bold], [bold]${self.model.cost:.2f}[/bold]):[/red]\n",
+                f"\n[red][bold]mini-swe-agent[/bold] (step [bold]{self.model.n_calls}[/bold], [bold]${self.model.cost:.2f}[/bold]){kwargs_str}:[/red]\n",
                 end="",
                 highlight=False,
             )
         else:
-            console.print(f"\n[bold green]{role.capitalize()}[/bold green]:\n", end="", highlight=False)
+            console.print(f"\n[bold green]{role.capitalize()}[/bold green]{kwargs_str}:\n", end="", highlight=False)
         console.print(content, highlight=False, markup=False)
 
     def query(self) -> dict:

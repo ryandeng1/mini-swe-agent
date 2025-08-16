@@ -80,7 +80,7 @@ def get_model_class(model_name: str) -> type:
         from minisweagent.models.roulette import FirstThenModel
 
         return FirstThenModel
-    if model_name.lower() == "interleaving":
+    if model_name.lower() == "interleaved":
         from minisweagent.models.roulette import InterleavingModel
 
         return InterleavingModel
