@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from minisweagent import Environment, Model
-from minisweagent.agents.default import AgentConfig, DefaultAgent
+from minisweagent.agents.default import AgentConfig, DefaultAgent, Submitted
 
 
 @dataclass
@@ -16,8 +16,11 @@ class DoubleCheckingAgent(DefaultAgent):
         self.submit_unlocked = False
 
     def has_finished(self, output: dict[str, str]):
-        if self.submit_unlocked:
+        try:
             super().has_finished(output)
-        else:
-            self.submit_unlocked = True
-            self.add_message(role="user", content=self.config.submit_unlocked_template)
+        except Submitted:
+            if self.submit_unlocked:
+                raise
+            else:
+                self.submit_unlocked = True
+                self.add_message(role="user", content=self.config.submit_unlocked_template)
