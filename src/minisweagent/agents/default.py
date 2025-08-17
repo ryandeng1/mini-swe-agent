@@ -4,6 +4,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 from jinja2 import Template
 
@@ -27,6 +28,7 @@ class AgentConfig:
     action_observation_template: str = "Observation: {{output}}"
     step_limit: int = 0
     cost_limit: float = 3.0
+    agent_class: Literal["default"] = "default"
 
 
 class NonTerminatingException(Exception):

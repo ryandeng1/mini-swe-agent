@@ -35,6 +35,7 @@ class TextualAgentConfig(AgentConfig):
     """Never confirm actions that match these regular expressions."""
     confirm_exit: bool = True
     """If the agent wants to finish, do we ask for confirmation from user?"""
+    agent_class: Literal["interactive_textual"] = "interactive_textual"
 
 
 class _TextualAgent(DefaultAgent):

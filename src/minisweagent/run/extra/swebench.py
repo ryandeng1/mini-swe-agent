@@ -18,7 +18,7 @@ from datasets import load_dataset
 from rich.live import Live
 
 from minisweagent import Environment
-from minisweagent.agents.default import DefaultAgent
+from minisweagent.agents import get_agent_class
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.environments import get_environment
 from minisweagent.models import get_model
@@ -49,20 +49,21 @@ DATASET_MAPPING = {
 _OUTPUT_FILE_LOCK = threading.Lock()
 
 
-class ProgressTrackingAgent(DefaultAgent):
-    """Simple wrapper around DefaultAgent that provides progress updates."""
+def inject_progress_tracking(agent, progress_manager: RunBatchProgressManager, instance_id: str):
+    """Inject progress tracking functionality into any agent instance."""
+    agent.progress_manager = progress_manager
+    agent.instance_id = instance_id
 
-    def __init__(self, *args, progress_manager: RunBatchProgressManager, instance_id: str = "", **kwargs):
-        super().__init__(*args, **kwargs)
-        self.progress_manager: RunBatchProgressManager = progress_manager
-        self.instance_id = instance_id
+    original_step = agent.step
 
-    def step(self) -> dict:
-        """Override step to provide progress updates."""
-        self.progress_manager.update_instance_status(
-            self.instance_id, f"Step {self.model.n_calls + 1:3d} (${self.model.cost:.2f})"
+    def step_with_progress() -> dict:
+        agent.progress_manager.update_instance_status(
+            agent.instance_id, f"Step {agent.model.n_calls + 1:3d} (${agent.model.cost:.2f})"
         )
-        return super().step()
+        return original_step()
+
+    agent.step = step_with_progress
+    return agent
 
 
 def get_swebench_docker_image_name(instance: dict) -> str:
@@ -133,13 +134,10 @@ def process_instance(
 
     try:
         env = get_sb_environment(config, instance)
-        agent = ProgressTrackingAgent(
-            model,
-            env,
-            progress_manager=progress_manager,
-            instance_id=instance_id,
-            **config.get("agent", {}),
-        )
+        agent_config = config.get("agent", {})
+        agent_class = get_agent_class(agent_config.get("agent_class", "default"))
+        agent = agent_class(model, env, **agent_config)
+        agent = inject_progress_tracking(agent, progress_manager, instance_id)
         exit_status, result = agent.run(task)
     except Exception as e:
         logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
@@ -193,6 +191,7 @@ def main(
     redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
     config_spec: Path = typer.Option( builtin_config_dir / "extra" / "swebench.yaml", "-c", "--config", help="Path to a config file", rich_help_panel="Basic"),
     environment_class: str | None = typer.Option( None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
+    agent_class: str | None = typer.Option(None, "--agent-class", help="Agent class to use", rich_help_panel="Advanced"),
 ) -> None:
     # fmt: on
     output_path = Path(output)
@@ -217,6 +216,8 @@ def main(
         config.setdefault("environment", {})["environment_class"] = environment_class
     if model is not None:
         config.setdefault("model", {})["model_name"] = model
+    if agent_class is not None:
+        config.setdefault("agent", {})["agent_class"] = agent_class
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
