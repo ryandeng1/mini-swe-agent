@@ -68,6 +68,9 @@ def main(
     exit_status, result = None, None
     try:
         exit_status, result = agent.run(instance["problem_statement"])  # type: ignore[arg-type]
+    except Exception as e:
+        logger.exception(f"Error running agent {selected_agent_class.__name__}: {exit_status=}, {result=}", exc_info=True)
+        exit_status, result = type(e).__name__, str(e)
     finally:
         save_traj(agent, output, exit_status=exit_status, result=result)  # type: ignore[arg-type]
 
