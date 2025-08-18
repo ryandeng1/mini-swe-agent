@@ -1,5 +1,6 @@
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,7 @@ class SampleModelConfig:
     model_name: str = "sample"
     n_samples: int = 10
     model_kwargs: Any = None  # ignored
+    n_threads: int = 1
 
 
 class SampleModel(Model):
@@ -42,16 +44,26 @@ class SampleModel(Model):
             "n_samples": self.config.n_samples,
         }
 
+    def _process_sample(self, i_sample: int, messages: list[dict]) -> str | None:
+        """Process a single sample and return the extracted action or None if invalid."""
+        model = self.sample_models[i_sample % len(self.sample_models)]
+        response = model.query(messages)
+        _actions = re.findall(r"```bash\n(.*?)\n```", response["content"], re.DOTALL)
+        if len(_actions) != 1:
+            logger.warning(f"Sample {i_sample} returned {len(_actions)} actions, expected 1")
+            return None
+        return _actions[0].strip()
+
     def _get_samples(self, messages: list[dict]) -> list[dict]:
         actions = []
-        for i_sample in range(self.config.n_samples):
-            model = self.sample_models[i_sample % len(self.sample_models)]
-            response = model.query(messages)
-            _actions = re.findall(r"```bash\n(.*?)\n```", response["content"], re.DOTALL)
-            if len(_actions) != 1:
-                logger.warning(f"Sample {i_sample} returned {len(_actions)} actions, expected 1")
-                continue
-            actions.append(_actions[0].strip())
+        with ThreadPoolExecutor(max_workers=self.config.n_threads) as executor:
+            futures = [
+                executor.submit(self._process_sample, i_sample, messages) for i_sample in range(self.config.n_samples)
+            ]
+            for future in futures:
+                action = future.result()
+                if action is not None:
+                    actions.append(action)
         actions = list(set(actions))
         logger.debug(f"Got {len(actions)} unique actions from {self.config.n_samples} samples")
         return actions
