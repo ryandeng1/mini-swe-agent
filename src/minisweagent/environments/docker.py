@@ -1,5 +1,6 @@
 import logging
 import os
+import platform
 import shlex
 import subprocess
 import uuid
@@ -50,7 +51,7 @@ class DockerEnvironment:
         self._start_container()
 
     def get_template_vars(self) -> dict[str, Any]:
-        return asdict(self.config)
+        return asdict(self.config) | platform.uname()._asdict() | os.environ
 
     def _start_container(self):
         """Start the Docker container and return the container ID."""
@@ -68,6 +69,7 @@ class DockerEnvironment:
             "sleep",
             self.config.container_timeout,
         ]
+        self.logger.debug(f"run args: {self.config.run_args}")
         self.logger.debug(f"Starting container with command: {shlex.join(cmd)}")
         result = subprocess.run(
             cmd,
@@ -95,7 +97,8 @@ class DockerEnvironment:
         result = subprocess.run(
             cmd,
             text=True,
-            timeout=timeout or self.config.timeout,
+            # timeout=timeout or self.config.timeout,
+            timeout=1200,
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,

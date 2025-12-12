@@ -67,6 +67,7 @@ class LimitsExceeded(TerminatingException):
 class OptAttempt:
     diff: str
     speedup: float
+    perf_report: str
 
 class DefaultAgent:
     def __init__(self, model: Model, env: Environment, *, config_class: type = AgentConfig, **kwargs):
@@ -91,12 +92,14 @@ class DefaultAgent:
 
     def run(self, task: str, **kwargs) -> tuple[str, str]:
         """Run step() until agent is finished. Return exit status & message"""
-        self.extra_template_vars |= {"task": task, **kwargs}
+        initial_perf_report = self.run_profiler(reference=True)
+        # self.extra_template_vars |= {"task": task, **kwargs}
+        self.extra_template_vars |= {"task": task, "perf_report": initial_perf_report, **kwargs}
         self.messages = []
         self.add_message("system", self.render_template(self.config.system_template))
         self.add_message("user", self.render_template(self.config.instance_template))
+        console.print(f"prompt: {self.messages[-1]['content']}")
         # self.fingerprint = self.env.execute(GET_FINGERPRINT_CMD)["output"]
-        self.run_profiler(reference=True)
         attempt = 0
         while True:
             try:
@@ -151,16 +154,17 @@ class DefaultAgent:
         if perf_output["returncode"] != 0:
             observation = self.render_template(self.config.test_script_error_template, output=perf_output)
         else:
-            runtime = float(perf_output["output"])
+            runtime = float(perf_output["output"].splitlines()[-1])
+            perf_report = "\n".join(perf_output["output"].splitlines()[:-1])
             if reference:
                 self.reference_runtime = runtime
-                observation = ""
+                observation = perf_report
             else:
                 diff_output = self.env.execute(DIFF_COMMAND)
                 diff = diff_output["output"]
                 speedup = self.reference_runtime / runtime
-                perf_dict = {"speedup" : speedup, "diff" : diff}
-                self.opt_attempts.append(OptAttempt(diff=diff, speedup=speedup))
+                perf_dict = {"speedup" : speedup, "diff" : diff, "perf_report" : perf_report}
+                self.opt_attempts.append(OptAttempt(diff=diff, speedup=speedup, perf_report=perf_report))
                 observation = self.render_template(self.config.test_script_perf_template, output=perf_dict)
         return observation
 
@@ -186,33 +190,33 @@ class DefaultAgent:
         # print(f"DEBUG: got observation: {observation}")
         self.add_message("user", observation)
         return output
-        action = self.parse_action(response)
-        output = self.execute_action(action)
-        bash_cmd = action["action"]
-        # console.print(f"output from cmd: {bash_cmd} is: {output['output']}")
-        if self.did_edit_files():
-            build_output = self.env.execute(BUILD_COMMAND)
-            console.print(f"[bold blue] len cmd: {len(bash_cmd)}, cmd: {bash_cmd} is an edit command, build return code: {build_output['returncode']}[/bold blue]")
-            try:
-                if build_output["returncode"] != 0:
-                    build_output["edit"] = bash_cmd
-                    observation = self.render_template(self.config.compiler_error_template, output=build_output)
-                    self.add_message("user", observation)
-                    console.print(f"[bold red] edit resulted in compiler error [/bold red]")
-                    console.print(observation)
-                    console.print(f"[bold red] end observation [/bold red]")
-                    return build_output
-                else:
-                    observation = self.render_template(self.config.action_observation_template, output=output)
-                    self.add_message("user", observation)
-                    return output
-            except Exception as e:
-                console.print(f"len: {len(build_output)}, build output: {build_output}")
-                raise e
-        else:
-            observation = self.render_template(self.config.action_observation_template, output=output)
-            self.add_message("user", observation)
-            return output
+        # action = self.parse_action(response)
+        # output = self.execute_action(action)
+        # bash_cmd = action["action"]
+        # # console.print(f"output from cmd: {bash_cmd} is: {output['output']}")
+        # if self.did_edit_files():
+        #     build_output = self.env.execute(BUILD_COMMAND)
+        #     console.print(f"[bold blue] len cmd: {len(bash_cmd)}, cmd: {bash_cmd} is an edit command, build return code: {build_output['returncode']}[/bold blue]")
+        #     try:
+        #         if build_output["returncode"] != 0:
+        #             build_output["edit"] = bash_cmd
+        #             observation = self.render_template(self.config.compiler_error_template, output=build_output)
+        #             self.add_message("user", observation)
+        #             console.print(f"[bold red] edit resulted in compiler error [/bold red]")
+        #             console.print(observation)
+        #             console.print(f"[bold red] end observation [/bold red]")
+        #             return build_output
+        #         else:
+        #             observation = self.render_template(self.config.action_observation_template, output=output)
+        #             self.add_message("user", observation)
+        #             return output
+        #     except Exception as e:
+        #         console.print(f"len: {len(build_output)}, build output: {build_output}")
+        #         raise e
+        # else:
+        #     observation = self.render_template(self.config.action_observation_template, output=output)
+        #     self.add_message("user", observation)
+        #     return output
 
     def parse_action(self, response: dict) -> dict:
         """Parse the action from the message. Returns the action."""
