@@ -1,5 +1,6 @@
 """Basic agent class. See https://mini-swe-agent.com/latest/advanced/control_flow/ for visual explanation."""
 
+from dataclasses import dataclass
 import re
 import subprocess
 import time
@@ -11,12 +12,8 @@ from minisweagent import Environment, Model
 
 from rich.console import Console
 
-BUILD_COMMAND = "pip install -e . --no-build-isolation"
-GET_FINGERPRINT_CMD = "git diff | sha1sum"
-
 console = Console(highlight=False)
 
-@dataclass
 class AgentConfig(BaseModel):
     # Check the config files in minisweagent/config for example settings
     system_template: str
@@ -27,6 +24,7 @@ class AgentConfig(BaseModel):
     compiler_error_template: str
     test_script_error_template: str
     test_script_perf_template: str
+    perf_diff_summary_template: str
     action_regex: str = r"```bash\s*\n(.*?)\n```"
     step_limit: int = 0
     cost_limit: float = 3.0
@@ -58,9 +56,9 @@ class LimitsExceeded(TerminatingException):
 
 @dataclass
 class OptAttempt:
-    diff: str
     speedup: float
     perf_report: str
+    diff: str
 
 class DefaultAgent:
     def __init__(self, model: Model, env: Environment, *, config_class: type = AgentConfig, **kwargs):
@@ -69,8 +67,7 @@ class DefaultAgent:
         self.model = model
         self.env = env
         self.extra_template_vars = {}
-        self.fingerprint = ""
-        self.MAX_ATTEMPTS = 3
+        self.MAX_ATTEMPTS = 5
         self.reference_runtime = -1
         self.opt_attempts = []
 
@@ -86,13 +83,11 @@ class DefaultAgent:
     def run(self, task: str, **kwargs) -> tuple[str, str]:
         """Run step() until agent is finished. Return exit status & message"""
         initial_perf_report = self.run_profiler(reference=True)
-        # self.extra_template_vars |= {"task": task, **kwargs}
+        console.print(f"initial perf report:\n{initial_perf_report}", style="bright_cyan")
         self.extra_template_vars |= {"task": task, "perf_report": initial_perf_report, **kwargs}
         self.messages = []
         self.add_message("system", self.render_template(self.config.system_template))
         self.add_message("user", self.render_template(self.config.instance_template))
-        console.print(f"prompt: {self.messages[-1]['content']}")
-        # self.fingerprint = self.env.execute(GET_FINGERPRINT_CMD)["output"]
         attempt = 0
         while True:
             try:
@@ -110,7 +105,7 @@ class DefaultAgent:
                 self.add_message("user", profiler_msg)
                 if attempt >= self.MAX_ATTEMPTS:
                     console.print(f"agent is done after: {self.MAX_ATTEMPTS} attempts")
-                    self.print_best_attempt()
+                    return self.print_best_attempt()
                     return type(e).__name__, str(e)
                 # return type(e).__name__, str(e)
 
@@ -127,45 +122,70 @@ class DefaultAgent:
         self.add_message("assistant", **response)
         return response
 
-    def did_edit_files(self) -> bool:
-        output = self.env.execute(GET_FINGERPRINT_CMD)["output"]
-        if output != self.fingerprint:
-            self.fingerprint = output
-            return True
-        return False
-
     def run_profiler(self, reference=False) -> str:
-        PERF_SCRIPT_COMMAND = f"python perf_script.py --reference {reference}"
-        DIFF_COMMAND = "git diff"
-        console.print(f"run profiler build")
+        if reference:
+            PERF_SCRIPT_COMMAND = f"/profile.sh reference"
+        else:
+            PERF_SCRIPT_COMMAND = f"/profile.sh"
+        BUILD_COMMAND = "/build.sh"
+        console.print(f"run profiler build cmd: {BUILD_COMMAND}", style="magenta")
         build_output = self.env.execute(BUILD_COMMAND)
         if build_output["returncode"] != 0:
+            if reference:
+                print(build_output["output"])
+                raise RuntimeError("failed to build reference repo")
             observation = self.render_template(self.config.compiler_error_template, output=build_output)
+            console.print(f"build error: {build_output}", style="red")
             return observation
-        console.print(f"run profiler perf script")
         perf_output = self.env.execute(PERF_SCRIPT_COMMAND)
         if perf_output["returncode"] != 0:
-            observation = self.render_template(self.config.test_script_error_template, output=perf_output)
+            if reference:
+                print(perf_output["output"])
+                raise RuntimeError("failed to run perf script as reference")
+            return self.render_template(self.config.test_script_error_template, output=perf_output)
         else:
-            runtime = float(perf_output["output"].splitlines()[-1])
-            perf_report = "\n".join(perf_output["output"].splitlines()[:-1])
+            # runtime = float(perf_output["output"].splitlines()[0])
+            runtime = None
+            for line in perf_output["output"].splitlines():
+                if "_runtime:" in line:
+                    runtime = float(line.split(":")[1])
+            if runtime is None:
+                raise RuntimeError("failed to parse runtime from perf script")
+            perf_report = "\n".join(perf_output["output"].splitlines()[1:])
             if reference:
                 self.reference_runtime = runtime
-                observation = perf_report
+                self.opt_attempts.append(OptAttempt(speedup=1.0, perf_report=perf_report, diff=""))
+                return perf_report
             else:
-                diff_output = self.env.execute(DIFF_COMMAND)
-                diff = diff_output["output"]
                 speedup = self.reference_runtime / runtime
-                perf_dict = {"speedup" : speedup, "diff" : diff, "perf_report" : perf_report}
-                self.opt_attempts.append(OptAttempt(diff=diff, speedup=speedup, perf_report=perf_report))
-                observation = self.render_template(self.config.test_script_perf_template, output=perf_dict)
-        return observation
+                prev_perf_report = self.opt_attempts[-1].perf_report
+                prev_speedup = self.opt_attempts[-1].speedup
+
+                perf_dict = {
+                    "prev_speedup" : prev_speedup,
+                    "curr_speedup" : speedup,
+                    "prev_perf_report" : prev_perf_report,
+                    "curr_perf_report" : perf_report
+                }
+                self.extra_template_vars |= perf_dict
+                msg = self.render_template(self.config.perf_diff_summary_template)
+                messages = []
+                messages.append({"role" : "system", "content" : "You are a helpful assistant that can that can analyze performance profiles for computer programs."})
+                messages.append({"role" : "user", "content": msg})
+                perf_diff_summary = self.model.query(messages)["content"]
+
+                perf_dict["perf_diff_summary"] = perf_diff_summary
+                diff = self.env.execute("git diff", cwd="/workspace")["output"]
+                self.opt_attempts.append(OptAttempt(speedup=speedup, perf_report=perf_report, diff=diff))
+                self.extra_template_vars |= perf_dict
+                return self.render_template(self.config.test_script_perf_template)
 
     def print_best_attempt(self):
         best_speedup = 0
         best_diff = ""
         best_idx = -1
-        for idx, obj in enumerate(self.opt_attempts):
+        # do not use attempt 0 (base repo) when finding best diff
+        for idx, obj in enumerate(self.opt_attempts[1:]):
             speedup = obj.speedup
             if speedup > best_speedup:
                 best_speedup = speedup
@@ -176,6 +196,10 @@ class DefaultAgent:
         console.print("--- diff ---")
         console.print(best_diff)
 
+        # self.env.execute("")
+        last_diff = self.env.execute("git diff", cwd="/workspace")["output"]
+        return best_diff, last_diff
+
     def get_observation(self, response: dict) -> dict:
         """Execute the action and return the observation."""
         output = self.execute_action(self.parse_action(response))
@@ -183,33 +207,6 @@ class DefaultAgent:
         # print(f"DEBUG: got observation: {observation}")
         self.add_message("user", observation)
         return output
-        # action = self.parse_action(response)
-        # output = self.execute_action(action)
-        # bash_cmd = action["action"]
-        # # console.print(f"output from cmd: {bash_cmd} is: {output['output']}")
-        # if self.did_edit_files():
-        #     build_output = self.env.execute(BUILD_COMMAND)
-        #     console.print(f"[bold blue] len cmd: {len(bash_cmd)}, cmd: {bash_cmd} is an edit command, build return code: {build_output['returncode']}[/bold blue]")
-        #     try:
-        #         if build_output["returncode"] != 0:
-        #             build_output["edit"] = bash_cmd
-        #             observation = self.render_template(self.config.compiler_error_template, output=build_output)
-        #             self.add_message("user", observation)
-        #             console.print(f"[bold red] edit resulted in compiler error [/bold red]")
-        #             console.print(observation)
-        #             console.print(f"[bold red] end observation [/bold red]")
-        #             return build_output
-        #         else:
-        #             observation = self.render_template(self.config.action_observation_template, output=output)
-        #             self.add_message("user", observation)
-        #             return output
-        #     except Exception as e:
-        #         console.print(f"len: {len(build_output)}, build output: {build_output}")
-        #         raise e
-        # else:
-        #     observation = self.render_template(self.config.action_observation_template, output=output)
-        #     self.add_message("user", observation)
-        #     return output
 
     def parse_action(self, response: dict) -> dict:
         """Parse the action from the message. Returns the action."""
@@ -229,6 +226,8 @@ class DefaultAgent:
                 self.render_template(self.config.timeout_template, action=action, output=output)
             )
         self.has_finished(output)
+        if action["action"].lower() == "true":
+            raise Submitted("LLM echos empty true block")
         return output | {"action": action["action"]}
 
     def has_finished(self, output: dict[str, str]):

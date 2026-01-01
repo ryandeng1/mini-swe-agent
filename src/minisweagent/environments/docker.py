@@ -51,7 +51,8 @@ class DockerEnvironment:
         self._start_container()
 
     def get_template_vars(self) -> dict[str, Any]:
-        return self.config.model_dump()
+        # return self.config.model_dump()
+        return self.config.model_dump() | platform.uname()._asdict() | os.environ
 
     def _start_container(self):
         """Start the Docker container and return the container ID."""
@@ -80,6 +81,13 @@ class DockerEnvironment:
         )
         self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
         self.container_id = result.stdout.strip()
+
+    def _copy_to_container(self, src: str, dest: str) -> None:
+        """Copy a file or directory from host to container."""
+        assert self.container_id, "Container not started"
+        cmd = [self.config.executable, "cp", src, f"{self.container_id}:{dest}"]
+        subprocess.run(cmd, check=True)
+        self.logger.info(f"copied file from: {src} to: {dest} in container {self.container_id}")
 
     def execute(self, command: str, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in the Docker container and return the result as a dict."""
