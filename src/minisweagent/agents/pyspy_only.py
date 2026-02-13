@@ -9,6 +9,8 @@ from jinja2 import StrictUndefined, Template
 
 from minisweagent import Environment, Model
 
+from rich.console import Console
+console = Console(highlight=False)
 
 @dataclass
 class AgentConfig:
@@ -62,7 +64,7 @@ class LimitsExceeded(TerminatingException):
     """Raised when the agent has reached its cost or step limit."""
 
 
-class DefaultAgent:
+class PySpyOnlyAgent:
     def __init__(self, model: Model, env: Environment, *, config_class: type = AgentConfig, **kwargs):
         self.config = config_class(**kwargs)
         self.messages: list[dict] = []
@@ -79,8 +81,10 @@ class DefaultAgent:
     def add_message(self, role: str, content: str, **kwargs):
         self.messages.append({"role": role, "content": content, "timestamp": time.time(), **kwargs})
 
-    def run(self, task: str, **kwargs) -> tuple[str, str]:
+    def run(self, task: str, **kwargs) -> str:
         """Run step() until agent is finished. Return exit status & message"""
+        # with py-spy only, we supply the perf script, run with the reference flag the first time
+        self.env.execute("python perf_script.py --reference", cwd="/")
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
         self.add_message("system", self.render_template(self.config.system_template))
@@ -92,7 +96,9 @@ class DefaultAgent:
                 self.add_message("user", str(e))
             except TerminatingException as e:
                 self.add_message("user", str(e))
-                return type(e).__name__, str(e)
+                diff = self.env.execute("git add -N . && git diff HEAD", cwd="/testbed")["output"]
+                return diff
+                # return type(e).__name__, str(e)
 
     def step(self) -> dict:
         """Query the LM, execute the action, return the observation."""
@@ -103,6 +109,7 @@ class DefaultAgent:
         if 0 < self.config.step_limit <= self.model.n_calls or 0 < self.config.cost_limit <= self.model.cost:
             raise LimitsExceeded()
         response = self.model.query(self.messages)
+        console.print(f"debug: got response: {response['content']}", style="bright_yellow")
         self.add_message("assistant", **response)
         return response
 
@@ -118,6 +125,15 @@ class DefaultAgent:
         actions = re.findall(self.config.action_regex, response["content"], re.DOTALL)
         if len(actions) == 1:
             return {"action": actions[0].strip(), **response}
+        
+        # hack, GPT 5.1 likes to output text that is just missing the backticks at the end for a lot of its python commands
+        add_three_backticks = response["content"] + "\n```"
+        actions = re.findall(self.config.action_regex, add_three_backticks, re.DOTALL)
+        if len(actions) == 1:
+            response["content"] = add_three_backticks
+            console.print(f"adding three backticks at the end worked")
+            return {"action": actions[0].strip(), **response}
+        console.print(f"did not find a single action from response.\n{response['content']}", style="bright_red")
         raise FormatError(self.render_template(self.config.format_error_template, actions=actions))
 
     def execute_action(self, action: dict) -> dict:
