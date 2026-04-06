@@ -16,9 +16,9 @@ from minisweagent import Environment, Model
 from rich.console import Console
 import statistics
 
-REFERENCE_TIMING_FILE = "/reference_timing.json"
-OPTIMIZED_TIMING_FILE = "/optimized_timing.json"
+TEST_CMD = "/run_tests.sh"
 BUILD_CMD = "/build.sh"
+PERF_SCRIPT = "/perf_script.py"
 REFERENCE_PROFILING_CMD = "python /profile_prob_script.py --reference"
 PROFILING_CMD = "python /profile_prob_script.py"
 console = Console(highlight=False)
@@ -30,8 +30,7 @@ class ProfilingAgentConfig(BaseModel):
     timeout_template: str
     format_error_template: str
     action_observation_template: str
-    compiler_error_template: str
-    test_script_error_template: str
+    runtime_error_template: str
     test_script_perf_template: str
     perf_summary_template: str
     max_attempts: int
@@ -64,6 +63,7 @@ class LimitsExceeded(TerminatingException):
 
 @dataclass
 class OptAttempt:
+    runtime: float
     speedup: float
     perf_report: str
     diff: str
@@ -75,7 +75,6 @@ class ProfilingAgent:
         self.model = model
         self.env = env
         self.extra_template_vars = {}
-        self.reference_runtimes = {}
         self.opt_attempts = []
 
     def render_template(self, template: str, **kwargs) -> str:
@@ -90,25 +89,30 @@ class ProfilingAgent:
     def get_reference_profiler_report(self):
         initial_perf_report = self.run_profiler(reference=True)
         console.print(f"initial perf report:\n{initial_perf_report}", style="bright_cyan")
-        self.add_message("system", self.render_template(self.config.system_template))
-        self.add_message("user", self.render_template(self.config.instance_template, initial_perf_report=initial_perf_report))
+        return initial_perf_report
 
     def run(self, task_type: str, **kwargs) -> list[dict]:
         """Run step() until agent is finished. Return exit status & message"""
         self.messages = []
-        self.get_reference_profiler_report()
+        initial_perf_report = self.get_reference_profiler_report()
+        self.add_message("system", self.render_template(self.config.system_template))
+        self.add_message("user", self.render_template(self.config.instance_template, initial_perf_report=initial_perf_report))
         attempt = 0
         while True:
             try:
                 self.step()
             except NonTerminatingException as e:
                 self.add_message("user", str(e))
+            except LimitsExceeded as e:
+                console.print(f"COST EXCEEDED! Num opt attempts: {len(self.opt_attempts) - 1}", style="bright_red")
+                return self.get_opt_attempts()
             except TerminatingException as e:
                 attempt += 1
                 console.print(f"model thinks it is done: {self.messages[-1]}", style="bright_green")
                 # remove the last terminating message as to not confuse the model in its context
                 self.messages.pop()
                 profiler_report = self.run_profiler(reference=False)
+                print(f"perf report:\n{profiler_report}")
                 self.add_message("user", profiler_report)
                 if attempt >= self.config.max_attempts:
                     return self.get_opt_attempts()
@@ -127,6 +131,7 @@ class ProfilingAgent:
         return response
 
     def test_profiler(self):
+        raise RuntimeError("test profiler deprecated")
         profiler_cmd = REFERENCE_PROFILING_CMD
 
         build_output = self.env.execute(BUILD_CMD)
@@ -152,64 +157,69 @@ class ProfilingAgent:
 
         console.print(f"profiler output:\n{profiler_output['output']}", style="bright_blue")
 
-    def run_profiler(self, reference=False) -> str:
-        if reference:
-            profiler_cmd = REFERENCE_PROFILING_CMD
-        else:
-            profiler_cmd = PROFILING_CMD
-
-        build_output = self.env.execute(BUILD_CMD)
-        if build_output["returncode"] != 0:
-            if reference:
-                console.print(build_output["output"])
-                raise RuntimeError("failed to build reference repo")
-            observation = self.render_template(self.config.compiler_error_template, output=build_output)
-            console.print(f"build error: {build_output}", style="red")
-            return observation
-
-        profiler_output = self.env.execute(profiler_cmd, cwd="/")
-        console.print(f"run profiler cmd: {profiler_cmd}", style="magenta")
-        if reference and profiler_output["returncode"] != 0:
-            raise RuntimeError(f"running profiler on reference should never error. output: {profiler_output['output']}")
-        
-        if profiler_output["returncode"] != 0 or "error running script" in profiler_output["output"]:
-            # running the script errored
-            return self.render_template(self.config.test_script_error_template, output=profiler_output)
-
-        if reference:
-            timing_fname = REFERENCE_TIMING_FILE
-        else:
-            timing_fname = OPTIMIZED_TIMING_FILE
-
-        result = self.env.execute(f"cat {timing_fname}")
-        try:
-            runtime_dict = json.loads(result["output"])
-        except Exception as e:
-            console.print(f"output: {result['output']}")
-            console.print(f"profiler output: {profiler_output['output']}")
-            raise e
-
-        console.print(f"profiler output:\n{profiler_output['output']}", style="bright_blue")
-
+    def get_profiler_summary(self, profiler_output) -> str:
         msg = self.render_template(self.config.perf_summary_template, profiler_output=profiler_output["output"])
         messages = []
         messages.append({"role" : "system", "content" : "You are a helpful assistant that can that can analyze performance profiles for computer programs."})
         messages.append({"role" : "user", "content": msg})
         perf_report_summary = self.model.query(messages)["content"]
+        return perf_report_summary
+
+    def get_runtime(self, output: str) -> float:
+        for line in output.splitlines():
+            line = line.strip()
+            if "_runtime" in line:
+                try:
+                    return float(line.split(":")[1])
+                except Exception as e:
+                    raise RuntimeError(f"cannot parse runtime from line: {line}")
+
+        raise RuntimeError(f"cannot parse runtime from output: {output}")
+
+    def run_profiler(self, reference=False) -> str:
+        if not reference:
+            build_output = self.env.execute(BUILD_CMD)
+            if build_output["returncode"] != 0:
+                console.print(f"build error: {build_output['output']}", style="red")
+                build_error_header = f"The changes you made produced the following error when building the repository running: `{BUILD_CMD}`."
+                return self.render_template(self.config.runtime_error_template, header=build_error_header, output=build_output)
+                # return self.render_template(self.config.build_error_template, output=build_output)
+
+            test_output = self.env.execute(TEST_CMD)
+            print("--- run tests output returncode ---", test_output["returncode"])
+            print(test_output["output"])
+            if test_output["returncode"] != 0:
+                print(f"test error: {test_output['output']}")
+                test_error_header = f"The changes you made produced the following error when running the test suite using: `{TEST_CMD}`."
+                return self.render_template(self.config.runtime_error_template, header=test_error_header, output=test_output)
+
         if reference:
-            self.reference_runtimes = runtime_dict
-            self.opt_attempts.append(OptAttempt(speedup=1.0, perf_report=perf_report_summary, diff=""))
-            return perf_report_summary
+            profiler_cmd = REFERENCE_PROFILING_CMD
         else:
-            assert runtime_dict.keys() == self.reference_runtimes.keys()
-            speedups = []
-            for k in runtime_dict:
-                speedups.append(self.reference_runtimes[k] / runtime_dict[k])
-            geomean_speedup = statistics.geometric_mean(speedups)
-            console.print(f"speedups: {speedups}, overall geomean speedup: {geomean_speedup}, ref runtimes: {self.reference_runtimes}, my runtimes: {runtime_dict}", style="bright_green")
-            diff = self.env.execute("git add -N . && git diff HEAD", cwd="/testbed")["output"]
-            self.opt_attempts.append(OptAttempt(speedup=geomean_speedup, perf_report=perf_report_summary, diff=diff))
-            return self.render_template(self.config.test_script_perf_template, perf_report_summary=perf_report_summary, speedup=geomean_speedup)
+            profiler_cmd = PROFILING_CMD
+
+        profiler_output = self.env.execute(profiler_cmd, cwd="/")
+        if profiler_output["returncode"] != 0:
+            if reference:
+                raise RuntimeError(f"running profiler on reference should never error. output: {profiler_output['output']}")
+            else:
+                test_script_error_header = f"The changes you made produced the following error when running the test script: `{PERF_SCRIPT}`."
+                return self.render_template(self.config.runtime_error_template, header=test_script_error_header, output=profiler_output)
+                # return self.render_template(self.config.test_script_error_template, output=profiler_output)
+
+        runtime = self.get_runtime(profiler_output["output"])
+
+        console.print(f"profiler output:\n{profiler_output['output']}", style="bright_blue")
+        perf_report_summary = self.get_profiler_summary(profiler_output)
+        if reference:
+            self.opt_attempts.append(OptAttempt(runtime=runtime, speedup=1.0, perf_report=perf_report_summary, diff=""))
+            return perf_report_summary
+            
+        speedup = self.opt_attempts[0].runtime / runtime
+        console.print(f"speedup: {speedup}, ref runtime: {self.opt_attempts[0].runtime}, my runtime: {runtime}", style="bright_green")
+        diff = self.env.execute("git add -A && git diff --cached", cwd="/testbed")["output"]
+        self.opt_attempts.append(OptAttempt(runtime=runtime, speedup=speedup, perf_report=perf_report_summary, diff=diff))
+        return self.render_template(self.config.test_script_perf_template, perf_report_summary=perf_report_summary, speedup=speedup)
 
     def get_opt_attempts(self) -> list[dict]:
         attempts = []
@@ -219,8 +229,14 @@ class ProfilingAgent:
 
     def get_observation(self, response: dict) -> dict:
         """Execute the action and return the observation."""
+        is_run_tests_cmd = TEST_CMD in self.parse_action(response)["action"]
+        start = time.time()
         output = self.execute_action(self.parse_action(response))
+        end = time.time()
         observation = self.render_template(self.config.action_observation_template, output=output)
+        if is_run_tests_cmd:
+            print(f"-- run tests observation took: {end - start}s --")
+            print(output["output"])
         self.add_message("user", observation)
         return output
 

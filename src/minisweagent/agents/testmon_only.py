@@ -63,7 +63,7 @@ class LimitsExceeded(TerminatingException):
     """Raised when the agent has reached its cost or step limit."""
 
 
-class PySpyOnlyAgent:
+class TestmonOnlyAgent:
     def __init__(self, model: Model, env: Environment, *, config_class: type = PySpyOnlyAgentConfig, **kwargs):
         self.config = config_class(**kwargs)
         self.messages: list[dict] = []
@@ -94,6 +94,9 @@ class PySpyOnlyAgent:
                 self.step()
             except NonTerminatingException as e:
                 self.add_message("user", str(e))
+            except LimitsExceeded as e:
+                console.print(f"COST EXCEEDED!", style="bright_red")
+                return ""
             except TerminatingException as e:
                 self.add_message("user", str(e))
                 diff = self.env.execute("git add -N . && git diff HEAD", cwd="/testbed")["output"]
@@ -113,10 +116,23 @@ class PySpyOnlyAgent:
         self.add_message("assistant", **response)
         return response
 
+    # def get_observation(self, response: dict) -> dict:
+    #     """Execute the action and return the observation."""
+    #     output = self.execute_action(self.parse_action(response))
+    #     observation = self.render_template(self.config.action_observation_template, output=output)
+    #     self.add_message("user", observation)
+    #     return output
+
     def get_observation(self, response: dict) -> dict:
         """Execute the action and return the observation."""
+        is_run_tests_cmd = "/run_tests.sh" in self.parse_action(response)["action"]
+        start = time.time()
         output = self.execute_action(self.parse_action(response))
+        end = time.time()
         observation = self.render_template(self.config.action_observation_template, output=output)
+        if is_run_tests_cmd:
+            print(f"-- run tests observation took: {end - start}s --")
+            print(output["output"])
         self.add_message("user", observation)
         return output
 
