@@ -28,10 +28,11 @@ class DockerEnvironmentConfig(BaseModel):
     """Additional arguments to pass to the docker/container executable.
     Default is ["--rm"], which removes the container after it exits.
     """
-    container_timeout: str = "2h"
+    container_timeout: str = "12h"
     """Max duration to keep container running. Uses the same format as the sleep command."""
     pull_timeout: int = 120
     """Timeout in seconds for pulling images."""
+    command_prefix: str = ""
 
 
 class DockerEnvironment:
@@ -82,17 +83,34 @@ class DockerEnvironment:
         self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
         self.container_id = result.stdout.strip()
 
-    def _copy_to_container(self, src: str, dest: str) -> None:
+    def copy_to_container(self, src: str, dest: str) -> None:
         """Copy a file or directory from host to container."""
         assert self.container_id, "Container not started"
         cmd = [self.config.executable, "cp", src, f"{self.container_id}:{dest}"]
         subprocess.run(cmd, check=True)
         self.logger.info(f"copied file from: {src} to: {dest} in container {self.container_id}")
 
+    def _copy_to_container(self, src: str, dest: str) -> None:
+        """Backward-compatible alias for copy_to_container."""
+        self.copy_to_container(src, dest)
+
+    def copy_from_container(self, src: str, dest: str) -> None:
+        """Copy a file or directory from container to host."""
+        assert self.container_id, "Container not started"
+        cmd = [self.config.executable, "cp", f"{self.container_id}:{src}", dest]
+        subprocess.run(cmd, check=True)
+        self.logger.info(f"copied file from: {src} in container {self.container_id} to: {dest}")
+
+    def _copy_from_container(self, src: str, dest: str) -> None:
+        """Backward-compatible alias for copy_from_container."""
+        self.copy_from_container(src, dest)
+
     def execute(self, command: str, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in the Docker container and return the result as a dict."""
         cwd = cwd or self.config.cwd
         assert self.container_id, "Container not started"
+        if self.config.command_prefix:
+            command = f"{self.config.command_prefix} && {command}"
 
         cmd = [self.config.executable, "exec", "-w", cwd]
         for key in self.config.forward_env:
@@ -105,8 +123,7 @@ class DockerEnvironment:
         result = subprocess.run(
             cmd,
             text=True,
-            # timeout=timeout or self.config.timeout,
-            timeout=1200,
+            timeout=timeout or self.config.timeout,
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
