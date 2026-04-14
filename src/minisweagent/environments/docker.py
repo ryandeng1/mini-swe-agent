@@ -31,10 +31,12 @@ class DockerEnvironmentConfig(BaseModel):
     """Additional arguments to pass to the docker/container executable.
     Default is ["--rm"], which removes the container after it exits.
     """
-    container_timeout: str = "2h"
+    container_timeout: str = "12h"
     """Max duration to keep container running. Uses the same format as the sleep command."""
     pull_timeout: int = 120
     """Timeout in seconds for pulling images."""
+    command_prefix: str = ""
+    """Command to prepend to every executed command (joined with &&)."""
     interpreter: list[str] = ["bash", "-lc"]
     """Interpreter to use to execute commands. Default is ["bash", "-lc"].
     The actual command will be appended as argument to this. Override this to e.g., modify shell flags
@@ -71,6 +73,20 @@ class DockerEnvironment:
             }
         }
 
+    def copy_to_container(self, src: str, dest: str) -> None:
+        """Copy a file or directory from host to container."""
+        assert self.container_id, "Container not started"
+        cmd = [self.config.executable, "cp", src, f"{self.container_id}:{dest}"]
+        subprocess.run(cmd, check=True)
+        self.logger.info(f"copied file from: {src} to: {dest} in container {self.container_id}")
+
+    def copy_from_container(self, src: str, dest: str) -> None:
+        """Copy a file or directory from container to host."""
+        assert self.container_id, "Container not started"
+        cmd = [self.config.executable, "cp", f"{self.container_id}:{src}", dest]
+        subprocess.run(cmd, check=True)
+        self.logger.info(f"copied file from: {src} in container {self.container_id} to: {dest}")
+
     def _start_container(self):
         """Start the Docker container and return the container ID."""
         container_name = f"minisweagent-{uuid.uuid4().hex[:8]}"
@@ -103,6 +119,8 @@ class DockerEnvironment:
         command = action.get("command", "")
         cwd = cwd or self.config.cwd
         assert self.container_id, "Container not started"
+        if self.config.command_prefix:
+            command = f"{self.config.command_prefix} && {command}"
 
         cmd = [self.config.executable, "exec", "-w", cwd]
         for key in self.config.forward_env:

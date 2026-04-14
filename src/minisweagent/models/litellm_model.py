@@ -11,8 +11,8 @@ from pydantic import BaseModel
 
 from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.utils.actions_toolcall import (
-    BASH_TOOL,
     format_toolcall_observation_messages,
+    get_tools,
     parse_toolcall_actions,
 )
 from minisweagent.models.utils.anthropic_utils import _reorder_anthropic_thinking_blocks
@@ -43,6 +43,8 @@ class LitellmModelConfig(BaseModel):
     """Template used to render the observation after executing an action."""
     multimodal_regex: str = ""
     """Regex to extract multimodal content. Empty string disables multimodal processing."""
+    extra_tools: list[str] = []
+    """Names of extra tools to enable alongside bash (e.g. ["str_replace_editor"])."""
 
 
 class LitellmModel:
@@ -62,11 +64,11 @@ class LitellmModel:
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
+            merged = {"tools": get_tools(self.config.extra_tools)} | self.config.model_kwargs | kwargs
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
-                tools=[BASH_TOOL],
-                **(self.config.model_kwargs | kwargs),
+                **merged,
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
@@ -84,8 +86,13 @@ class LitellmModel:
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = response.choices[0].message.model_dump()
+        # When tools=[] is passed, this is a pure text query — skip action parsing.
+        if kwargs.get("tools") == []:
+            actions = []
+        else:
+            actions = self._parse_actions(response)
         message["extra"] = {
-            "actions": self._parse_actions(response),
+            "actions": actions,
             "response": response.model_dump(),
             **cost_output,
             "timestamp": time.time(),

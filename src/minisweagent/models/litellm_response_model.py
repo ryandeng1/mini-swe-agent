@@ -7,8 +7,8 @@ import litellm
 from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.litellm_model import LitellmModel, LitellmModelConfig
 from minisweagent.models.utils.actions_toolcall_response import (
-    BASH_TOOL_RESPONSE_API,
     format_toolcall_observation_messages,
+    get_tools_response_api,
     parse_toolcall_actions_response,
 )
 from minisweagent.models.utils.retry import retry
@@ -40,7 +40,7 @@ class LitellmResponseModel(LitellmModel):
             return litellm.responses(
                 model=self.config.model_name,
                 input=messages,
-                tools=[BASH_TOOL_RESPONSE_API],
+                tools=get_tools_response_api(self.config.extra_tools),
                 **(self.config.model_kwargs | kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:

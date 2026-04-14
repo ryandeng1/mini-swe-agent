@@ -12,6 +12,11 @@ from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import InterruptAgentFlow, LimitsExceeded
+from minisweagent.tools.editor_shim import (
+    deploy_editor_script,
+    execute_editor_action,
+    make_editor_namespace,
+)
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -41,6 +46,7 @@ class DefaultAgent:
         self.logger = logging.getLogger("agent")
         self.cost = 0.0
         self.n_calls = 0
+        self._editor_history_namespace = make_editor_namespace()
 
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
@@ -116,9 +122,35 @@ class DefaultAgent:
         self.add_messages(message)
         return message
 
+    def _ensure_editor_deployed(self):
+        """Deploy the editor script into the environment on first use."""
+        if not getattr(self, "_editor_deployed", False):
+            deploy_editor_script(self.env)
+            self._editor_deployed = True
+
+    def _execute_action(self, action: dict) -> dict:
+        """Execute a single action and return an output dict.
+
+        Routes bash actions to env.execute() directly. Routes str_replace_editor
+        actions through a self-contained script deployed into the environment,
+        so it works identically for local, Docker, and Singularity environments.
+        """
+        tool = action.get("tool", "bash")
+        if tool == "bash":
+            return self.env.execute(action)
+        elif tool == "str_replace_editor":
+            self._ensure_editor_deployed()
+            return execute_editor_action(
+                self.env,
+                action.get("args", {}),
+                history_namespace=self._editor_history_namespace,
+            )
+        else:
+            return {"output": f"Unknown tool: {tool}", "returncode": 1}
+
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
-        outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
+        outputs = [self._execute_action(action) for action in message.get("extra", {}).get("actions", [])]
         return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
 
     def serialize(self, *extra_dicts) -> dict:

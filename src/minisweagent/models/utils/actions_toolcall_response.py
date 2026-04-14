@@ -6,6 +6,7 @@ import time
 from jinja2 import StrictUndefined, Template
 
 from minisweagent.exceptions import FormatError
+from minisweagent.models.utils.actions_toolcall import STR_REPLACE_EDITOR_TOOL, KNOWN_TOOLS
 
 # OpenRouter/OpenAI Responses API uses a flat structure (no nested "function" key)
 BASH_TOOL_RESPONSE_API = {
@@ -23,6 +24,28 @@ BASH_TOOL_RESPONSE_API = {
         "required": ["command"],
     },
 }
+
+# Flat variant of the str_replace_editor tool for the Responses API
+STR_REPLACE_EDITOR_TOOL_RESPONSE_API = {
+    "type": "function",
+    "name": STR_REPLACE_EDITOR_TOOL["function"]["name"],
+    "description": STR_REPLACE_EDITOR_TOOL["function"]["description"],
+    "parameters": STR_REPLACE_EDITOR_TOOL["function"]["parameters"],
+}
+
+_EXTRA_TOOL_REGISTRY_RESPONSE_API = {
+    "str_replace_editor": STR_REPLACE_EDITOR_TOOL_RESPONSE_API,
+}
+
+
+def get_tools_response_api(extra_tool_names: list[str] | None = None) -> list[dict]:
+    """Build the tools list from BASH_TOOL_RESPONSE_API + any extra tools by name."""
+    tools = [BASH_TOOL_RESPONSE_API]
+    for name in extra_tool_names or []:
+        if name not in _EXTRA_TOOL_REGISTRY_RESPONSE_API:
+            raise ValueError(f"Unknown extra tool: {name!r}. Available: {list(_EXTRA_TOOL_REGISTRY_RESPONSE_API)}")
+        tools.append(_EXTRA_TOOL_REGISTRY_RESPONSE_API[name])
+    return tools
 
 
 def _format_error_message(error_text: str) -> dict:
@@ -59,20 +82,25 @@ def parse_toolcall_actions_response(output: list, *, format_error_template: str)
     for tool_call in tool_calls:
         error_msg = ""
         args = {}
+        name = tool_call.get("name")
         try:
             args = json.loads(tool_call.get("arguments", "{}"))
         except Exception as e:
             error_msg = f"Error parsing tool call arguments: {e}."
-        if tool_call.get("name") != "bash":
-            error_msg += f"Unknown tool '{tool_call.get('name')}'."
-        if not isinstance(args, dict) or "command" not in args:
+        if name not in KNOWN_TOOLS:
+            error_msg += f"Unknown tool '{name}'."
+        if name == "bash" and (not isinstance(args, dict) or "command" not in args):
             error_msg += "Missing 'command' argument in bash tool call."
         if error_msg:
             error_text = Template(format_error_template, undefined=StrictUndefined).render(
                 error=error_msg.strip(), actions=[]
             )
             raise FormatError(_format_error_message(error_text))
-        actions.append({"command": args["command"], "tool_call_id": tool_call.get("call_id") or tool_call.get("id")})
+        call_id = tool_call.get("call_id") or tool_call.get("id")
+        if name == "bash":
+            actions.append({"tool": "bash", "command": args["command"], "tool_call_id": call_id})
+        else:
+            actions.append({"tool": name, "args": args, "tool_call_id": call_id})
     return actions
 
 
